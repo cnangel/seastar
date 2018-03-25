@@ -53,6 +53,7 @@
 #include "cacheline.hh"
 #include "memory.hh"
 #include "reactor.hh"
+#include "util/alloc_failure_injector.hh"
 
 namespace seastar {
 
@@ -534,7 +535,7 @@ cpu_pages::find_and_unlink_span(unsigned n_pages) {
     auto idx = index_of_conservative(n_pages);
     auto orig_idx = idx;
     if (n_pages >= (2u << idx)) {
-        throw std::bad_alloc();
+        return nullptr;
     }
     while (idx < nr_span_lists && fsu.free_spans[idx].empty()) {
         ++idx;
@@ -1207,7 +1208,7 @@ void* allocate_large(size_t size) {
     abort_on_underflow(size);
     unsigned size_in_pages = (size + page_size - 1) >> page_bits;
     if ((size_t(size_in_pages) << page_bits) < size) {
-        throw std::bad_alloc();
+        return nullptr; // (size + page_size - 1) caused an overflow
     }
     return cpu_mem.allocate_large(size_in_pages);
 
@@ -1228,6 +1229,28 @@ size_t object_size(void* ptr) {
     return cpu_pages::all_cpus[object_cpu_id(ptr)]->object_size(ptr);
 }
 
+[[gnu::always_inline]]
+static inline cpu_pages& get_cpu_mem()
+{
+    // cpu_pages has a non-trivial constructor which means that the compiler
+    // must make sure the instance local to the current thread has been
+    // constructed before each access.
+    // Unfortunately, this means that GCC will emit an unconditional call
+    // to __tls_init(), which may incurr a noticeable overhead in applications
+    // that are heavy on memory allocations.
+    // This can be solved by adding an easily predictable branch checking
+    // whether the object has already been constructed.
+    static thread_local cpu_pages* cpu_mem_ptr;
+    if (__builtin_expect(!bool(cpu_mem_ptr), false)) {
+        // Mark as cold so that GCC8+ can move this part of the function
+        // to .text.unlikely.
+        [&] () [[gnu::cold]] {
+            cpu_mem_ptr = &cpu_mem;
+        }();
+    }
+    return *cpu_mem_ptr;
+}
+
 void* allocate(size_t size) {
     if (size <= sizeof(free_object)) {
         size = sizeof(free_object);
@@ -1235,7 +1258,7 @@ void* allocate(size_t size) {
     void* ptr;
     if (size <= max_small_allocation) {
         size = object_size_with_alloc_site(size);
-        ptr = cpu_mem.allocate_small(size);
+        ptr = get_cpu_mem().allocate_small(size);
     } else {
         ptr = allocate_large(size);
     }
@@ -1247,16 +1270,15 @@ void* allocate(size_t size) {
 }
 
 void* allocate_aligned(size_t align, size_t size) {
-    size = std::max(size, align);
     if (size <= sizeof(free_object)) {
-        size = sizeof(free_object);
+        size = std::max(sizeof(free_object), align);
     }
     void* ptr;
     if (size <= max_small_allocation && align <= page_size) {
         // Our small allocator only guarantees alignment for power-of-two
         // allocations which are not larger than a page.
         size = 1 << log2ceil(object_size_with_alloc_site(size));
-        ptr = cpu_mem.allocate_small(size);
+        ptr = get_cpu_mem().allocate_small(size);
     } else {
         ptr = allocate_large_aligned(align, size);
     }
@@ -1268,19 +1290,26 @@ void* allocate_aligned(size_t align, size_t size) {
 }
 
 void free(void* obj) {
-    if (cpu_mem.try_cross_cpu_free(obj)) {
+    if (get_cpu_mem().try_cross_cpu_free(obj)) {
         return;
     }
     ++g_frees;
-    cpu_mem.free(obj);
+    get_cpu_mem().free(obj);
 }
 
 void free(void* obj, size_t size) {
-    if (cpu_mem.try_cross_cpu_free(obj)) {
+    if (get_cpu_mem().try_cross_cpu_free(obj)) {
         return;
     }
     ++g_frees;
-    cpu_mem.free(obj, size);
+    get_cpu_mem().free(obj, size);
+}
+
+void free_aligned(void* obj, size_t align, size_t size) {
+    if (size <= sizeof(free_object)) {
+        size = sizeof(free_object);
+    }
+    free(obj, size);
 }
 
 void shrink(void* obj, size_t new_size) {
@@ -1451,6 +1480,19 @@ void on_allocation_failure(size_t size) {
     }
 }
 
+static void trigger_error_injector() {
+    on_alloc_point();
+}
+
+static bool try_trigger_error_injector() {
+    try {
+        on_alloc_point();
+        return false;
+    } catch (...) {
+        return true;
+    }
+}
+
 }
 
 }
@@ -1461,12 +1503,10 @@ extern "C"
 [[gnu::visibility("default")]]
 [[gnu::externally_visible]]
 void* malloc(size_t n) throw () {
-    try {
-        return allocate(n);
-    } catch (std::bad_alloc& ba) {
-        on_allocation_failure(n);
+    if (try_trigger_error_injector()) {
         return nullptr;
     }
+    return allocate(n);
 }
 
 extern "C"
@@ -1491,6 +1531,9 @@ void* __libc_free(void* obj) throw ();
 extern "C"
 [[gnu::visibility("default")]]
 void* calloc(size_t nmemb, size_t size) {
+    if (try_trigger_error_injector()) {
+        return nullptr;
+    }
     auto s1 = __int128(nmemb) * __int128(size);
     assert(s1 == size_t(s1));
     size_t s = s1;
@@ -1509,6 +1552,9 @@ void* __libc_calloc(size_t n, size_t m) throw ();
 extern "C"
 [[gnu::visibility("default")]]
 void* realloc(void* ptr, size_t size) {
+    if (try_trigger_error_injector()) {
+        return nullptr;
+    }
     auto old_size = ptr ? object_size(ptr) : 0;
     if (size == old_size) {
         return ptr;
@@ -1541,16 +1587,14 @@ extern "C"
 [[gnu::visibility("default")]]
 [[gnu::externally_visible]]
 int posix_memalign(void** ptr, size_t align, size_t size) {
-    try {
-        *ptr = allocate_aligned(align, size);
-        if (!*ptr) {
-            return ENOMEM;
-        }
-        return 0;
-    } catch (std::bad_alloc&) {
-        on_allocation_failure(size);
+    if (try_trigger_error_injector()) {
         return ENOMEM;
     }
+    *ptr = allocate_aligned(align, size);
+    if (!*ptr) {
+        return ENOMEM;
+    }
+    return 0;
 }
 
 extern "C"
@@ -1561,21 +1605,20 @@ int __libc_posix_memalign(void** ptr, size_t align, size_t size) throw ();
 extern "C"
 [[gnu::visibility("default")]]
 void* memalign(size_t align, size_t size) {
-    try {
-        return allocate_aligned(align, size);
-    } catch (std::bad_alloc&) {
-        return NULL;
+    if (try_trigger_error_injector()) {
+        return nullptr;
     }
+    size = seastar::align_up(size, align);
+    return allocate_aligned(align, size);
 }
 
 extern "C"
 [[gnu::visibility("default")]]
 void *aligned_alloc(size_t align, size_t size) {
-    try {
-        return allocate_aligned(align, size);
-    } catch (std::bad_alloc&) {
-        return NULL;
+    if (try_trigger_error_injector()) {
+        return nullptr;
     }
+    return allocate_aligned(align, size);
 }
 
 extern "C"
@@ -1616,6 +1659,7 @@ void* throw_if_null(void* ptr) {
 
 [[gnu::visibility("default")]]
 void* operator new(size_t size) {
+    trigger_error_injector();
     if (size == 0) {
         size = 1;
     }
@@ -1624,6 +1668,7 @@ void* operator new(size_t size) {
 
 [[gnu::visibility("default")]]
 void* operator new[](size_t size) {
+    trigger_error_injector();
     if (size == 0) {
         size = 1;
     }
@@ -1660,14 +1705,13 @@ void operator delete[](void* ptr, size_t size) throw () {
 
 [[gnu::visibility("default")]]
 void* operator new(size_t size, std::nothrow_t) throw () {
+    if (try_trigger_error_injector()) {
+        return nullptr;
+    }
     if (size == 0) {
         size = 1;
     }
-    try {
-        return allocate(size);
-    } catch (...) {
-        return nullptr;
-    }
+    return allocate(size);
 }
 
 [[gnu::visibility("default")]]
@@ -1675,11 +1719,7 @@ void* operator new[](size_t size, std::nothrow_t) throw () {
     if (size == 0) {
         size = 1;
     }
-    try {
-        return allocate(size);
-    } catch (...) {
-        return nullptr;
-    }
+    return allocate(size);
 }
 
 [[gnu::visibility("default")]]
@@ -1710,12 +1750,91 @@ void operator delete[](void* ptr, size_t size, std::nothrow_t) throw () {
     }
 }
 
+#ifdef __cpp_aligned_new
+
+[[gnu::visibility("default")]]
+void* operator new(size_t size, std::align_val_t a) {
+    trigger_error_injector();
+    auto ptr = allocate_aligned(size_t(a), size);
+    return throw_if_null(ptr);
+}
+
+[[gnu::visibility("default")]]
+void* operator new[](size_t size, std::align_val_t a) {
+    trigger_error_injector();
+    auto ptr = allocate_aligned(size_t(a), size);
+    return throw_if_null(ptr);
+}
+
+[[gnu::visibility("default")]]
+void* operator new(size_t size, std::align_val_t a, const std::nothrow_t&) noexcept {
+    if (try_trigger_error_injector()) {
+        return nullptr;
+    }
+    return allocate_aligned(size_t(a), size);
+}
+
+[[gnu::visibility("default")]]
+void* operator new[](size_t size, std::align_val_t a, const std::nothrow_t&) noexcept {
+    if (try_trigger_error_injector()) {
+        return nullptr;
+    }
+    return allocate_aligned(size_t(a), size);
+}
+
+
+[[gnu::visibility("default")]]
+void operator delete(void* ptr, std::align_val_t a) noexcept {
+    if (ptr) {
+        seastar::memory::free(ptr);
+    }
+}
+
+[[gnu::visibility("default")]]
+void operator delete[](void* ptr, std::align_val_t a) noexcept {
+    if (ptr) {
+        seastar::memory::free(ptr);
+    }
+}
+
+[[gnu::visibility("default")]]
+void operator delete(void* ptr, size_t size, std::align_val_t a) noexcept {
+    if (ptr) {
+        seastar::memory::free_aligned(ptr, size_t(a), size);
+    }
+}
+
+[[gnu::visibility("default")]]
+void operator delete[](void* ptr, size_t size, std::align_val_t a) noexcept {
+    if (ptr) {
+        seastar::memory::free_aligned(ptr, size_t(a), size);
+    }
+}
+
+[[gnu::visibility("default")]]
+void operator delete(void* ptr, std::align_val_t a, const std::nothrow_t&) noexcept {
+    if (ptr) {
+        seastar::memory::free(ptr);
+    }
+}
+
+[[gnu::visibility("default")]]
+void operator delete[](void* ptr, std::align_val_t a, const std::nothrow_t&) noexcept {
+    if (ptr) {
+        seastar::memory::free(ptr);
+    }
+}
+
+#endif
+
 void* operator new(size_t size, seastar::with_alignment wa) {
-    return allocate_aligned(wa.alignment(), size);
+    trigger_error_injector();
+    return throw_if_null(allocate_aligned(wa.alignment(), size));
 }
 
 void* operator new[](size_t size, seastar::with_alignment wa) {
-    return allocate_aligned(wa.alignment(), size);
+    trigger_error_injector();
+    return throw_if_null(allocate_aligned(wa.alignment(), size));
 }
 
 void operator delete(void* ptr, seastar::with_alignment wa) {

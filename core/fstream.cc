@@ -387,7 +387,17 @@ public:
         }
 
         return _file.dma_write(pos, p, buf_size, _options.io_priority_class).then(
-                [this, buf = std::move(buf), truncate] (size_t size) {
+                [this, pos, buf = std::move(buf), truncate, buf_size] (size_t size) mutable {
+            // short write handling
+            if (size < buf_size) {
+                buf.trim_front(size);
+                return do_put(pos + size, std::move(buf)).then([this, truncate] {
+                    if (truncate) {
+                        return _file.truncate(_pos);
+                    }
+                    return make_ready_future<>();
+                });
+            }
             if (truncate) {
                 return _file.truncate(_pos);
             }
@@ -435,6 +445,12 @@ output_stream<char> make_file_output_stream(file f, size_t buffer_size) {
 output_stream<char> make_file_output_stream(file f, file_output_stream_options options) {
     return output_stream<char>(file_data_sink(std::move(f), options), options.buffer_size, true);
 }
+
+/*
+ * template initialization, definition in iostream-impl.hh
+ */
+template struct internal::stream_copy_consumer<char>;
+template future<> copy<char>(input_stream<char>&, output_stream<char>&);
 
 }
 

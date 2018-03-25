@@ -651,7 +651,7 @@ public:
                     return make_exception_future<>(std::system_error(res, glts_errorc));
                 }
             }
-            if (_type == type::CLIENT) {
+            if (_type == type::CLIENT || _creds->_impl->get_client_auth() != client_auth::NONE) {
                 verify();
             }
             _connected = true;
@@ -724,8 +724,11 @@ public:
 
     void verify() {
         unsigned int status;
-        auto res = gnutls_certificate_verify_peers3(*this,
-                _hostname.empty() ? nullptr : _hostname.c_str(), &status);
+        auto res = gnutls_certificate_verify_peers3(*this, _type != type::CLIENT || _hostname.empty()
+                        ? nullptr : _hostname.c_str(), &status);
+        if (res == GNUTLS_E_NO_CERTIFICATE_FOUND && _type != type::CLIENT && _creds->_impl->get_client_auth() != client_auth::REQUIRE) {
+            return;
+        }
         if (res < 0) {
             throw std::system_error(res, glts_errorc);
         }
@@ -782,7 +785,6 @@ public:
                 case GNUTLS_E_REHANDSHAKE:
                     // server requests new HS. must release semaphore, so set new state
                     // and return nada.
-                    assert(_type == type::CLIENT); // should never get this in server session
                     _connected = false;
                     return make_ready_future<temporary_buffer<char>>();
                 default:
@@ -915,7 +917,7 @@ public:
                 return handle_output_error(res);
             }
         }
-        return make_ready_future<>();
+        return wait_for_output();
     }
     future<> wait_for_eof() {
         // read records until we get an eof alert
@@ -925,7 +927,7 @@ public:
                 if (eof()) {
                     return make_ready_future<stop_iteration>(stop_iteration::yes);
                 }
-                return do_get().then([this](auto buf) {
+                return do_get().then([](auto buf) {
                    return make_ready_future<stop_iteration>(stop_iteration::no);
                 });
             });

@@ -29,7 +29,6 @@
 #include "circular_buffer_fixed_capacity.hh"
 #include <memory>
 #include <type_traits>
-#include <libaio.h>
 #include <sys/epoll.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -48,6 +47,7 @@
 #include <chrono>
 #include <ratio>
 #include <atomic>
+#include <stack>
 #include <experimental/optional>
 #include <boost/lockfree/spsc_queue.hpp>
 #include <boost/optional.hpp>
@@ -55,6 +55,7 @@
 #include <boost/thread/barrier.hpp>
 #include <boost/container/static_vector.hpp>
 #include <set>
+#include "linux-aio.hh"
 #include "util/eclipse.hh"
 #include "future.hh"
 #include "posix.hh"
@@ -319,11 +320,12 @@ class smp_message_queue {
     };
     struct work_item {
         virtual ~work_item() {}
-        virtual future<> process() = 0;
+        virtual void process() = 0;
         virtual void complete() = 0;
     };
     template <typename Func>
     struct async_work_item : work_item {
+        smp_message_queue& _queue;
         Func _func;
         using futurator = futurize<std::result_of_t<Func()>>;
         using future_type = typename futurator::type;
@@ -331,19 +333,20 @@ class smp_message_queue {
         std::experimental::optional<value_type> _result;
         std::exception_ptr _ex; // if !_result
         typename futurator::promise_type _promise; // used on local side
-        async_work_item(Func&& func) : _func(std::move(func)) {}
-        virtual future<> process() override {
+        async_work_item(smp_message_queue& queue, Func&& func) : _queue(queue), _func(std::move(func)) {}
+        virtual void process() override {
             try {
-                return futurator::apply(this->_func).then_wrapped([this] (auto&& f) {
-                    try {
+                futurator::apply(this->_func).then_wrapped([this] (auto f) {
+                    if (f.failed()) {
+                        _ex = f.get_exception();
+                    } else {
                         _result = f.get();
-                    } catch (...) {
-                        _ex = std::current_exception();
                     }
+                    _queue.respond(this);
                 });
             } catch (...) {
                 _ex = std::current_exception();
-                return make_ready_future();
+                _queue.respond(this);
             }
         }
         virtual void complete() override {
@@ -369,7 +372,7 @@ public:
     smp_message_queue(reactor* from, reactor* to);
     template <typename Func>
     futurize_t<std::result_of_t<Func()>> submit(Func&& func) {
-        auto wi = std::make_unique<async_work_item<Func>>(std::forward<Func>(func));
+        auto wi = std::make_unique<async_work_item<Func>>(*this, std::forward<Func>(func));
         auto fut = wi->get_future();
         submit_item(std::move(wi));
         return fut;
@@ -545,7 +548,7 @@ private:
     std::unordered_map<unsigned, lw_shared_ptr<priority_class_data>> _priority_classes;
     fair_queue _fq;
 
-    static constexpr unsigned _max_classes = 1024;
+    static constexpr unsigned _max_classes = 2048;
     static std::array<std::atomic<uint32_t>, _max_classes> _registered_shares;
     static std::array<sstring, _max_classes> _registered_names;
 
@@ -571,16 +574,40 @@ public:
         return _fq.waiters();
     }
 
+    // How many requests are sent to disk but not yet returned.
+    size_t requests_currently_executing() const {
+        return _fq.requests_currently_executing();
+    }
+
+    // Inform the underlying queue about the fact that some of our requests finished
+    void notify_requests_finished(size_t finished) {
+        _fq.notify_requests_finished(finished);
+    }
+
+    // Dispatch requests that are pending in the I/O queue
+    void poll_io_queue() {
+        _fq.dispatch_requests();
+    }
+
     shard_id coordinator() const {
         return _coordinator;
     }
     shard_id coordinator_of_shard(shard_id shard) const {
         return _io_topology[shard];
     }
+
+    future<> update_shares_for_class(io_priority_class pc, size_t new_shares);
+
     friend class reactor;
 };
 
 constexpr unsigned max_scheduling_groups() { return 16; }
+
+namespace internal {
+
+class reactor_stall_sampler;
+
+}
 
 class reactor {
     using sched_clock = std::chrono::steady_clock;
@@ -628,6 +655,7 @@ private:
     friend class syscall_pollfn;
     friend class execution_stage_pollfn;
     friend class file_data_source_impl; // for fstream statistics
+    friend class internal::reactor_stall_sampler;
 public:
     class poller {
         std::unique_ptr<pollfn> _pollfn;
@@ -722,9 +750,11 @@ private:
     timer_set<timer<lowres_clock>, &timer<lowres_clock>::_link>::timer_list_t _expired_lowres_timers;
     timer_set<timer<manual_clock>, &timer<manual_clock>::_link> _manual_timers;
     timer_set<timer<manual_clock>, &timer<manual_clock>::_link>::timer_list_t _expired_manual_timers;
-    io_context_t _io_context;
-    std::vector<struct ::iocb> _pending_aio;
-    semaphore _io_context_available;
+    ::aio_context_t _io_context;
+    alignas(cache_line_size) std::array<::iocb, max_aio> _iocb_pool;
+    std::stack<::iocb*, boost::container::static_vector<::iocb*, max_aio>> _free_iocbs;
+    boost::container::static_vector<::iocb*, max_aio> _pending_aio;
+    boost::container::static_vector<::iocb*, max_aio> _pending_aio_retry;
     io_stats _io_stats;
     uint64_t _fsyncs = 0;
     uint64_t _cxx_exceptions = 0;
@@ -784,6 +814,7 @@ private:
     static std::chrono::nanoseconds calculate_poll_time();
     static void block_notifier(int);
     void wakeup();
+    size_t handle_aio_error(::iocb* iocb, int ec);
     bool flush_pending_aio();
     bool flush_tcp_batches();
     bool do_expire_lowres_timers();
@@ -835,7 +866,7 @@ private:
     bool have_more_tasks() const;
     bool posix_reuseport_detect();
     void task_quota_timer_thread_fn();
-    void run_some_tasks(sched_clock::time_point& t_run_completed);
+    void run_some_tasks();
     void activate(task_queue& tq);
     void insert_active_task_queue(task_queue* tq);
     void insert_activating_task_queues();
@@ -857,6 +888,18 @@ public:
 
     io_priority_class register_one_priority_class(sstring name, uint32_t shares) {
         return io_queue::register_one_priority_class(std::move(name), shares);
+    }
+
+    /// \brief Updates the current amount of shares for a given priority class
+    ///
+    /// This can involve a cross-shard call if the I/O Queue that is responsible for
+    /// this class lives in a foreign shard.
+    ///
+    /// \param pc the priority class handle
+    /// \param shares the new shares value
+    /// \return a future that is ready when the share update is applied
+    future<> update_shares_for_class(io_priority_class pc, uint32_t shares) {
+        return _io_queue->update_shares_for_class(pc, shares);
     }
 
     void configure(boost::program_options::variables_map config);
@@ -898,7 +941,8 @@ public:
     // in which it was generated. Therefore, care must be taken to avoid the use of objects that could
     // be destroyed within or at exit of prepare_io.
     template <typename Func>
-    future<io_event> submit_io(Func prepare_io);
+    void submit_io(promise<io_event>*, Func prepare_io);
+
     template <typename Func>
     future<io_event> submit_io_read(const io_priority_class& priority_class, size_t len, Func prepare_io);
     template <typename Func>
@@ -921,11 +965,18 @@ public:
         _at_destroy_tasks->_q.push_back(make_task(default_scheduling_group(), std::forward<Func>(func)));
     }
 
+#ifdef SEASTAR_SHUFFLE_TASK_QUEUE
+    void shuffle(std::unique_ptr<task>&, task_queue&);
+#endif
+
     void add_task(std::unique_ptr<task>&& t) {
         auto sg = t->group();
         auto* q = _task_queues[sg._id].get();
         bool was_empty = q->_q.empty();
         q->_q.push_back(std::move(t));
+#ifdef SEASTAR_SHUFFLE_TASK_QUEUE
+        shuffle(q->_q.back(), *q);
+#endif
         if (was_empty) {
             activate(*q);
         }
@@ -935,6 +986,9 @@ public:
         auto* q = _task_queues[sg._id].get();
         bool was_empty = q->_q.empty();
         q->_q.push_front(std::move(t));
+#ifdef SEASTAR_SHUFFLE_TASK_QUEUE
+        shuffle(q->_q.front(), *q);
+#endif
         if (was_empty) {
             activate(*q);
         }

@@ -2279,11 +2279,23 @@ std::unique_ptr<net::device> create_dpdk_net_device(
                                                enable_fc);
 }
 
+std::unique_ptr<net::device> create_dpdk_net_device(
+                                    const hw_config& hw_cfg)
+{
+    return create_dpdk_net_device(*hw_cfg.port_index, smp::count, hw_cfg.lro, hw_cfg.hw_fc);
+}
+
+
 boost::program_options::options_description
 get_dpdk_net_options_description()
 {
     boost::program_options::options_description opts(
             "DPDK net options");
+
+    opts.add_options()
+        ("dpdk-port-index",
+                boost::program_options::value<unsigned>()->default_value(0),
+                "DPDK Port Index");
 
     opts.add_options()
         ("hw-fc",

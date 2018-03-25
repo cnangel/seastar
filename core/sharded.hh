@@ -188,6 +188,17 @@ public:
     template <typename Func>
     future<> invoke_on_all(Func&& func);
 
+    /// Invoke a callable on all instances of  \c Service except the instance
+    /// which is allocated on current shard.
+    ///
+    /// \param func a callable with the signature `void (Service&)`
+    ///             or `future<> (Service&)`, to be called on each core
+    ///             with the local instance as an argument.
+    /// \return a `future<>` that becomes ready when all cores but the current one have
+    ///         processed the message.
+    template <typename Func>
+    future<> invoke_on_others(Func&& func);
+
     /// Invoke a method on all instances of `Service` and reduce the results using
     /// `Reducer`.
     ///
@@ -323,13 +334,16 @@ public:
     }
 
     /// Gets a reference to the local instance.
+    const Service& local() const;
+
+    /// Gets a reference to the local instance.
     Service& local();
 
     /// Gets a shared pointer to the local instance.
     shared_ptr<Service> local_shared();
 
     /// Checks whether the local instance has been initialized.
-    bool local_is_initialized();
+    bool local_is_initialized() const;
 
 private:
     void track_deletion(shared_ptr<Service>& s, std::false_type) {
@@ -504,6 +518,24 @@ sharded<Service>::invoke_on_all(Func&& func) {
 }
 
 template <typename Service>
+template <typename Func>
+inline
+future<>
+sharded<Service>::invoke_on_others(Func&& func) {
+    static_assert(std::is_same<futurize_t<std::result_of_t<Func(Service&)>>, future<>>::value,
+                  "invoke_on_others()'s func must return void or future<>");
+    return invoke_on_all([orig = engine().cpu_id(), func = std::forward<Func>(func)] (auto& s) -> future<> {
+        return engine().cpu_id() == orig ? make_ready_future<>() : futurize_apply(func, s);
+    });
+}
+
+template <typename Service>
+const Service& sharded<Service>::local() const {
+    assert(local_is_initialized());
+    return *_instances[engine().cpu_id()].service;
+}
+
+template <typename Service>
 Service& sharded<Service>::local() {
     assert(local_is_initialized());
     return *_instances[engine().cpu_id()].service;
@@ -516,7 +548,7 @@ shared_ptr<Service> sharded<Service>::local_shared() {
 }
 
 template <typename Service>
-inline bool sharded<Service>::local_is_initialized() {
+inline bool sharded<Service>::local_is_initialized() const {
     return _instances.size() > engine().cpu_id() &&
            _instances[engine().cpu_id()].service;
 }
@@ -550,11 +582,16 @@ private:
     PtrType _value;
     unsigned _cpu;
 private:
-    bool on_origin() {
-        return engine().cpu_id() == _cpu;
+    void destroy(PtrType p, unsigned cpu) {
+        if (p && engine().cpu_id() != cpu) {
+            smp::submit_to(cpu, [v = std::move(p)] () mutable {
+                auto local(std::move(v));
+            });
+        }
     }
 public:
     using element_type = typename std::pointer_traits<PtrType>::element_type;
+    using pointer = element_type*;
 
     /// Constructs a null \c foreign_ptr<>.
     foreign_ptr()
@@ -575,11 +612,7 @@ public:
     foreign_ptr(foreign_ptr&& other) = default;
     /// Destroys the wrapped object on its original cpu.
     ~foreign_ptr() {
-        if (_value && !on_origin()) {
-            smp::submit_to(_cpu, [v = std::move(_value)] () mutable {
-                auto local(std::move(v));
-            });
-        }
+        destroy(std::move(_value), _cpu);
     }
     /// Creates a copy of this foreign ptr. Only works if the stored ptr is copyable.
     future<foreign_ptr> copy() const {
@@ -592,10 +625,43 @@ public:
     element_type& operator*() const { return *_value; }
     /// Accesses the wrapped object.
     element_type* operator->() const { return &*_value; }
+    /// Access the raw pointer to the wrapped object.
+    pointer get() const { return &*_value; }
+    /// Return the owner-shard of this pointer.
+    ///
+    /// The owner shard of the pointer can change as a result of
+    /// move-assigment or a call to reset().
+    unsigned get_owner_shard() { return _cpu; }
     /// Checks whether the wrapped pointer is non-null.
     operator bool() const { return static_cast<bool>(_value); }
     /// Move-assigns a \c foreign_ptr<>.
     foreign_ptr& operator=(foreign_ptr&& other) = default;
+    /// Releases the owned pointer
+    ///
+    /// Warning: the caller is now responsible for destroying the
+    /// pointer on its owner shard. This method is best called on the
+    /// owner shard to avoid accidents.
+    PtrType release() {
+        return std::exchange(_value, {});
+    }
+    /// Replace the managed pointer with new_ptr.
+    ///
+    /// The previous managed pointer is destroyed on its owner shard.
+    void reset(PtrType new_ptr) {
+        auto old_ptr = std::move(_value);
+        auto old_cpu = _cpu;
+
+        _value = std::move(new_ptr);
+        _cpu = engine().cpu_id();
+
+        destroy(std::move(old_ptr), old_cpu);
+    }
+    /// Replace the managed pointer with a null value.
+    ///
+    /// The previous managed pointer is destroyed on its owner shard.
+    void reset(std::nullptr_t = nullptr) {
+        reset(PtrType());
+    }
 };
 
 /// Wraps a raw or smart pointer object in a \ref foreign_ptr<>.

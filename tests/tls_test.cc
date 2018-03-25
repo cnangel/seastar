@@ -57,7 +57,14 @@ static future<> connect_to_ssl_addr(::shared_ptr<tls::certificate_credentials> c
                             auto f = in.read();
                             return f.then([](temporary_buffer<char> buf) {
                                 // std::cout << buf.get() << std::endl;
-                                BOOST_CHECK(strncmp(buf.get(), "HTTP/", 5) == 0);
+
+                                // Avoid passing a nullptr as an argument of strncmp().
+                                // If the temporary_buffer is empty (e.g. due to the underlying TCP connection
+                                // being reset) passing the buf.get() (which would be a nullptr) to strncmp()
+                                // causes a runtime error which masks the actual issue.
+                                if (buf) {
+                                    BOOST_CHECK(strncmp(buf.get(), "HTTP/", 5) == 0);
+                                }
                                 BOOST_CHECK(buf.size() > 8);
                             });
                         });
@@ -250,9 +257,15 @@ public:
             , _size(message_size)
     {}
 
-    future<> listen(socket_address addr, sstring crtfile, sstring keyfile, tls::client_auth ca = tls::client_auth::NONE) {
+    future<> listen(socket_address addr, sstring crtfile, sstring keyfile, tls::client_auth ca = tls::client_auth::NONE, sstring trust = {}) {
         _certs->set_client_auth(ca);
-        return _certs->set_x509_key_file(crtfile, keyfile, tls::x509_crt_format::PEM).then([this, addr] {
+        auto f = _certs->set_x509_key_file(crtfile, keyfile, tls::x509_crt_format::PEM);
+        if (!trust.empty()) {
+            f = f.then([this, trust = std::move(trust)] {
+                return _certs->set_x509_trust_file(trust, tls::x509_crt_format::PEM);
+            });
+        }
+        return f.then([this, addr] {
             ::listen_options opts;
             opts.reuse_address = true;
 
@@ -273,7 +286,7 @@ public:
                                 return make_ready_future<stop_iteration>(stop_iteration::no);
                             });
                         });
-                    }).then([strms]{
+                    }).finally([strms]{
                         return strms->out.close();
                     }).finally([strms]{});
                 }).handle_exception([this](auto ep) {
@@ -296,7 +309,7 @@ public:
     future<> stop() {
         _stopped = true;
         _socket.abort_accept();
-        return _gate.close();
+        return _gate.close().handle_exception([] (std::exception_ptr ignored) { });
     }
 };
 
@@ -331,7 +344,11 @@ static future<> run_echo_test(sstring message,
         return certs->set_x509_trust_file(trust, tls::x509_crt_format::PEM);
     }).then([=] {
         return server->start(msg->size()).then([=]() {
-            return server->invoke_on_all(&echoserver::listen, addr, crt, key, ca);
+            sstring server_trust;
+            if (ca != tls::client_auth::NONE) {
+                server_trust = trust;
+            }
+            return server->invoke_on_all(&echoserver::listen, addr, crt, key, ca, server_trust);
         }).then([=] {
             return tls::connect(certs, addr, name).then([loops, msg, do_read](::connected_socket s) {
                 auto strms = ::make_lw_shared<streams>(std::move(s));
@@ -346,9 +363,20 @@ static future<> run_echo_test(sstring message,
                             });
                         });
                     });
-                }).then([strms, do_read]{
-                    return do_read ? strms->out.close() : make_ready_future<>();
-                }).finally([strms]{});
+                }).then_wrapped([strms, do_read] (future<> f1) {
+                    // Always call close()
+                    return (do_read ? strms->out.close() : make_ready_future<>()).then_wrapped([strms, f1 = std::move(f1)] (future<> f2) mutable {
+                        // Verification errors will be reported by the call to output_stream::close(),
+                        // which waits for the flush to actually happen. They can also be reported by the
+                        // input_stream::read_exactly() call. We want to keep only one and avoid nested exception mess.
+                        if (f1.failed()) {
+                            f2.handle_exception([] (std::exception_ptr ignored) { });
+                            return std::move(f1);
+                        }
+                        f1.handle_exception([] (std::exception_ptr ignored) { });
+                        return std::move(f2);
+                    }).finally([strms] { });
+                });
             });
         }).finally([server] {
             return server->stop().finally([server]{});
